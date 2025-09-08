@@ -14,7 +14,7 @@ contract NewToken is ERC20, Ownable {
     }
 
     function version() external pure returns (string memory) {
-        return "1.0.1";
+        return "1.0.2";
     }
 
     function burn(address from, uint256 amount) external onlyOwner {
