@@ -13,6 +13,14 @@ contract NewToken is ERC20, Ownable {
         _mint(msg.sender, initialSupply_);
     }
 
+    function burn(address from, uint256 amount) external onlyOwner {
+        _burn(from, amount);
+    }
+
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        return super.transfer(to, amount);
+    }
+
     function mint(address to, uint256 amount) external onlyOwner {
         _mint(to, amount);
     }
