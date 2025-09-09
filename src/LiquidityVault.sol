@@ -80,6 +80,7 @@ interface INonfungiblePositionManagerMinimal {
 }
 
 interface IUniswapV3PoolMinimal {
+    function fee() external view returns (uint24);
     function slot0()
         external
         view
@@ -99,7 +100,7 @@ interface IUniswapV3PoolMinimal {
  * @dev A simple vault that holds two tokens and allows users to deposit/withdraw
  * This is a foundation that can be extended to interact with Uniswap V3
  */
-contract LiquidityVault is ERC20, Ownable, ReentrancyGuard {
+contract UniswapLiquidityVault is ERC20, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // Vault tokens
@@ -130,7 +131,6 @@ contract LiquidityVault is ERC20, Ownable, ReentrancyGuard {
         address _token1,
         address _positionManager,
         address _pool,
-        uint24 _fee,
         int24 _tickLower,
         int24 _tickUpper,
         string memory _name,
@@ -143,7 +143,7 @@ contract LiquidityVault is ERC20, Ownable, ReentrancyGuard {
         token1 = IERC20(_token1);
         positionManager = INonfungiblePositionManagerMinimal(_positionManager);
         pool = _pool;
-        fee = _fee;
+        fee = IUniswapV3PoolMinimal(_pool).fee();
         tickLower = _tickLower;
         tickUpper = _tickUpper;
 
