@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 // Minimal interfaces to avoid importing full Uniswap packages that require older Solidity.
 interface INonfungiblePositionManagerMinimal {
@@ -80,6 +81,8 @@ interface INonfungiblePositionManagerMinimal {
 }
 
 interface IUniswapV3PoolMinimal {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
     function fee() external view returns (uint24);
     function slot0()
         external
@@ -102,6 +105,7 @@ interface IUniswapV3PoolMinimal {
  */
 contract UniswapLiquidityVault is ERC20, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using Math for uint256;
 
     // Vault tokens
     IERC20 public immutable token0;
@@ -127,8 +131,6 @@ contract UniswapLiquidityVault is ERC20, Ownable, ReentrancyGuard {
     event EmergencyWithdraw(address indexed user, uint256 amount0, uint256 amount1);
 
     constructor(
-        address _token0,
-        address _token1,
         address _positionManager,
         address _pool,
         int24 _tickLower,
@@ -136,16 +138,20 @@ contract UniswapLiquidityVault is ERC20, Ownable, ReentrancyGuard {
         string memory _name,
         string memory _symbol
     ) ERC20(_name, _symbol) {
-        require(_token0 != address(0) && _token1 != address(0), "Invalid token addresses");
         require(_positionManager != address(0), "Invalid position manager");
         require(_pool != address(0), "Invalid pool");
-        token0 = IERC20(_token0);
-        token1 = IERC20(_token1);
         positionManager = INonfungiblePositionManagerMinimal(_positionManager);
         pool = _pool;
         fee = IUniswapV3PoolMinimal(_pool).fee();
         tickLower = _tickLower;
         tickUpper = _tickUpper;
+
+        // Read tokens from pool
+        address _t0 = IUniswapV3PoolMinimal(_pool).token0();
+        address _t1 = IUniswapV3PoolMinimal(_pool).token1();
+        require(_t0 != address(0) && _t1 != address(0), "Invalid pool tokens");
+        token0 = IERC20(_t0);
+        token1 = IERC20(_t1);
 
         // Pre-approve position manager for efficiency
         token0.safeApprove(_positionManager, 0);
@@ -331,22 +337,7 @@ contract UniswapLiquidityVault is ERC20, Ownable, ReentrancyGuard {
         emit FeesUpdated(_managementFee, _performanceFee);
     }
 
-    /**
-     * @dev Get the total value held by the vault
-     * @return Total value as sum of both token balances
-     */
-    function getTotalValue() public view returns (uint256) {
-        // For simplicity, treat liquidity units plus idle token balances as total value proxy.
-        // Note: Units differ; this is only a rough proxy for accounting purposes.
-        uint256 l;
-        if (tokenId != 0) {
-            (, , , , , , , uint128 liquidity, , , , ) = positionManager.positions(tokenId);
-            l = uint256(liquidity);
-        }
-        uint256 idle0 = token0.balanceOf(address(this));
-        uint256 idle1 = token1.balanceOf(address(this));
-        return l + idle0 + idle1;
-    }
+    // removed idle-only getters in favor of position-based getters below
 
     /**
      * @dev Get individual token balances
@@ -366,8 +357,13 @@ contract UniswapLiquidityVault is ERC20, Ownable, ReentrancyGuard {
     function getSharePrice() public view returns (uint256) {
         uint256 totalShares = totalSupply();
         if (totalShares == 0) return 1e18; // Default price for first deposit
-        
-        return (getTotalValue() * 1e18) / totalShares;
+        // Total value = position amounts + idle balances
+        uint256 pos0 = getTotalToken0();
+        uint256 pos1 = getTotalToken1();
+        uint256 idle0 = token0.balanceOf(address(this));
+        uint256 idle1 = token1.balanceOf(address(this));
+        uint256 totalValue = pos0 + pos1 + idle0 + idle1;
+        return (totalValue * 1e18) / totalShares;
     }
 
     /**
@@ -436,5 +432,107 @@ contract UniswapLiquidityVault is ERC20, Ownable, ReentrancyGuard {
     function getPositionLiquidity() external view returns (uint128 liquidity) {
         if (tokenId == 0) return 0;
         (, , , , , , , liquidity, , , , ) = positionManager.positions(tokenId);
+    }
+
+    // ============================= INTERNAL PRICE/AMOUNT HELPERS =============================
+
+    uint160 private constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
+    uint160 private constant MIN_SQRT_RATIO = 4295128739;
+    uint256 private constant Q96 = 1 << 96;
+
+    function _getSqrtRatioAtTick(int24 tick) private pure returns (uint160 sqrtPriceX96) {
+        int256 t = int256(tick);
+        uint256 absTick = t < 0 ? uint256(-t) : uint256(t);
+        require(absTick <= uint256(887272), "T");
+
+        uint256 ratio = absTick & 0x1 != 0 ? 0xfffcb933bd6fad37aa2d162d1a594001 : 0x100000000000000000000000000000000;
+        if (absTick & 0x2 != 0) ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128;
+        if (absTick & 0x4 != 0) ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdcc) >> 128;
+        if (absTick & 0x8 != 0) ratio = (ratio * 0xffe5caca7e10e4e61c3624eaa0941cd0) >> 128;
+        if (absTick & 0x10 != 0) ratio = (ratio * 0xffcb9843d60f6159c9db58835c926644) >> 128;
+        if (absTick & 0x20 != 0) ratio = (ratio * 0xff973b41fa98c081472e6896dfb254c0) >> 128;
+        if (absTick & 0x40 != 0) ratio = (ratio * 0xff2ea16466c96a3843ec78b326b52861) >> 128;
+        if (absTick & 0x80 != 0) ratio = (ratio * 0xfe5dee046a99a2a811c461f1969c3053) >> 128;
+        if (absTick & 0x100 != 0) ratio = (ratio * 0xfcbe86c7900a88aedcffc83b479aa3a4) >> 128;
+        if (absTick & 0x200 != 0) ratio = (ratio * 0xf987a7253ac413176f2b074cf7815e54) >> 128;
+        if (absTick & 0x400 != 0) ratio = (ratio * 0xf3392b0822b70005940c7a398e4b70f3) >> 128;
+        if (absTick & 0x800 != 0) ratio = (ratio * 0xe7159475a2c29b7443b29c7fa6e889d9) >> 128;
+        if (absTick & 0x1000 != 0) ratio = (ratio * 0xd097f3bdfd2022b8845ad8f792aa5825) >> 128;
+        if (absTick & 0x2000 != 0) ratio = (ratio * 0xa9f746462d870fdf8a65dc1f90e061e5) >> 128;
+        if (absTick & 0x4000 != 0) ratio = (ratio * 0x70d869a156d2a1b890bb3df62baf32f7) >> 128;
+        if (absTick & 0x8000 != 0) ratio = (ratio * 0x31be135f97d08fd981231505542fcfa6) >> 128;
+        if (absTick & 0x10000 != 0) ratio = (ratio * 0x9aa508b5b7a84e1c677de54f3e99bc9) >> 128;
+        if (absTick & 0x20000 != 0) ratio = (ratio * 0x5d6af8dedb81196699c329225ee604) >> 128;
+        if (absTick & 0x40000 != 0) ratio = (ratio * 0x2216e584f5fa1ea926041bedfe98) >> 128;
+        if (absTick & 0x80000 != 0) ratio = (ratio * 0x48a170391f7dc42444e8fa2) >> 128;
+
+        if (tick > 0) ratio = type(uint256).max / ratio;
+        sqrtPriceX96 = uint160((ratio >> 32) + (ratio % (1 << 32) == 0 ? 0 : 1));
+        if (sqrtPriceX96 < MIN_SQRT_RATIO) sqrtPriceX96 = MIN_SQRT_RATIO;
+        if (sqrtPriceX96 > MAX_SQRT_RATIO) sqrtPriceX96 = MAX_SQRT_RATIO;
+    }
+
+    function _getAmount0ForLiquidity(
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint128 liquidity
+    ) private pure returns (uint256 amount0) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        uint256 numerator = (uint256(liquidity) << 96) * (sqrtRatioBX96 - sqrtRatioAX96);
+        amount0 = numerator.mulDiv(Q96, sqrtRatioBX96).mulDiv(1, sqrtRatioAX96);
+    }
+
+    function _getAmount1ForLiquidity(
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint128 liquidity
+    ) private pure returns (uint256 amount1) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        amount1 = Math.mulDiv(liquidity, sqrtRatioBX96 - sqrtRatioAX96, Q96);
+    }
+
+    function _getAmountsForLiquidity(
+        uint160 sqrtRatioX96,
+        uint160 sqrtRatioAX96,
+        uint160 sqrtRatioBX96,
+        uint128 liquidity
+    ) private pure returns (uint256 amount0, uint256 amount1) {
+        if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
+        if (sqrtRatioX96 <= sqrtRatioAX96) {
+            amount0 = _getAmount0ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity);
+        } else if (sqrtRatioX96 < sqrtRatioBX96) {
+            amount0 = _getAmount0ForLiquidity(sqrtRatioX96, sqrtRatioBX96, liquidity);
+            amount1 = _getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioX96, liquidity);
+        } else {
+            amount1 = _getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity);
+        }
+    }
+
+    /**
+     * @dev Return current token0 amount held inside the Uniswap position (excludes idle).
+     */
+    function getTotalToken0() public view returns (uint256) {
+        if (tokenId == 0) return 0;
+        (, , , , , , , uint128 liquidity, , , , ) = positionManager.positions(tokenId);
+        if (liquidity == 0) return 0;
+        (uint160 sqrtPriceX96, , , , , , ) = IUniswapV3PoolMinimal(pool).slot0();
+        uint160 sqrtLower = _getSqrtRatioAtTick(tickLower);
+        uint160 sqrtUpper = _getSqrtRatioAtTick(tickUpper);
+        (uint256 amount0, ) = _getAmountsForLiquidity(sqrtPriceX96, sqrtLower, sqrtUpper, liquidity);
+        return amount0;
+    }
+
+    /**
+     * @dev Return current token1 amount held inside the Uniswap position (excludes idle).
+     */
+    function getTotalToken1() public view returns (uint256) {
+        if (tokenId == 0) return 0;
+        (, , , , , , , uint128 liquidity, , , , ) = positionManager.positions(tokenId);
+        if (liquidity == 0) return 0;
+        (uint160 sqrtPriceX96, , , , , , ) = IUniswapV3PoolMinimal(pool).slot0();
+        uint160 sqrtLower = _getSqrtRatioAtTick(tickLower);
+        uint160 sqrtUpper = _getSqrtRatioAtTick(tickUpper);
+        (, uint256 amount1) = _getAmountsForLiquidity(sqrtPriceX96, sqrtLower, sqrtUpper, liquidity);
+        return amount1;
     }
 }
